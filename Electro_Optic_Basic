@@ -1,0 +1,343 @@
+# -*- coding: utf-8 -*-
+"""
+Electro-Optic Waveguide Simulation
+----------------------------------
+A script to simulate and visualize electric field, optical mode, and structure outlines
+for a ferroelectric modulator.
+"""
+import sys
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import griddata
+import shapely.geometry as sg
+
+# Add Lumerical API path
+sys.path.append(r"C:\Program Files\Lumerical\v242\api\python")
+import lumapi
+
+# Set directories
+work_dir = r"C:\Users\aeb1a25\Downloads"
+os.chdir(work_dir)
+device_results_dir = os.path.join(work_dir, "device_sim_results")
+mode_results_dir = os.path.join(work_dir, "zmax_sweep_results")
+plot_results_dir = os.path.join(work_dir, "comparison_plots")
+os.makedirs(device_results_dir, exist_ok=True)
+os.makedirs(mode_results_dir, exist_ok=True)
+os.makedirs(plot_results_dir, exist_ok=True)
+
+# File paths
+device_sim_file = os.path.join(work_dir, "ferroelectric_modulator(1).ldev")
+mode_sim_file = os.path.join(work_dir, "ferroelectric_modulator_1.lms")
+
+# Simulation parameters
+N_x = 60  # Grid dimensions for interpolation
+N_z = 60
+lambda_val = 1550e-9  # wavelength in meters
+voltage = np.linspace(1, 5, 9)  # bias voltages
+searchNeffNear = 2.6  # target effective index
+z_max = 0.30e-6  # in meters
+
+# Initialize waveguide_shapes dictionary for outlines
+waveguide_shapes = {}
+
+#----- Electrical Simulation Functions -----#
+
+def get_electric_field(device):
+    """Extract and process electric field data from DEVICE simulation."""
+    # Get raw field data
+    result = device.getresult("CHARGE::E_field", "electrostatics")
+    E = np.squeeze(result['E'])
+    x = np.squeeze(result['x'])
+    z = np.squeeze(result['z'])
+    tri = device.getdata("CHARGE::E_field", "electrostatics", "elements")
+    
+    # Extract 2D field components
+    if len(E.shape) == 3 and E.shape[1] > 1:
+        # Handle multi-bias data
+        bias_idx = 4  # Middle point
+        E_2D = np.zeros((E.shape[0], 2))
+        E_2D[:, 0] = E[:, bias_idx, 0]  # Ex
+        E_2D[:, 1] = E[:, bias_idx, 2]  # Ez
+    else:
+        E_2D = np.delete(E, 1, axis=1)  # Remove y-component
+    
+    # Extract components and domain boundaries
+    Ex_tri, Ez_tri = E_2D[:, 0], E_2D[:, 1]
+    x_min, x_max = np.min(x), np.max(x)
+    z_min, z_max = np.min(z), np.max(z)
+    
+    # Interpolate to regular grid
+    x_grid = np.linspace(x_min, x_max, N_x)
+    z_grid = np.linspace(z_min, z_max, N_z)
+    X, Z = np.meshgrid(x_grid, z_grid)
+    
+    # Create interpolation points
+    vt = np.zeros((len(x), 2))
+    vt[:, 0] = x
+    vt[:, 1] = z
+    
+    # Interpolate field components
+    Ex = device.interptri(tri, vt, Ex_tri, x_grid, z_grid)
+    Ez = device.interptri(tri, vt, Ez_tri, x_grid, z_grid)
+    E_mag = np.sqrt(Ex**2 + Ez**2)
+    
+    # Return processed data
+    return {
+        'Ex': Ex,
+        'Ez': Ez,
+        'E_mag': E_mag,
+        'X': X,
+        'Z': Z,
+        'x_grid': x_grid,
+        'z_grid': z_grid,
+        'x_min': x_min,
+        'x_max': x_max,
+        'z_min': z_min,
+        'z_max': z_max
+    }
+
+def get_component_geometry(mode, comp_name):
+    """Extract geometry for a component from MODE simulation."""
+    try:
+        mode.select(comp_name)
+        
+        # First try direct min/max properties
+        try:
+            x_min = mode.getnamed(comp_name, "x min")
+            x_max = mode.getnamed(comp_name, "x max")
+            z_min = mode.getnamed(comp_name, "z min")
+            z_max = mode.getnamed(comp_name, "z max")
+            return {"x min": x_min, "x max": x_max, "z min": z_min, "z max": z_max}
+        except:
+            # Try center/span approach
+            try:
+                x = mode.get("x")
+                z = mode.get("z")
+                x_span = mode.get("x span")
+                z_span = mode.get("z span")
+                return {
+                    "x min": x - x_span/2,
+                    "x max": x + x_span/2,
+                    "z min": z - z_span/2,
+                    "z max": z + z_span/2
+                }
+            except:
+                return None
+    except:
+        return None
+
+#----- Run Electrical Simulation -----#
+
+print("\n=== STARTING ELECTRICAL SIMULATION ===")
+
+# Start electrical simulation process with context manager
+with lumapi.DEVICE(hide=False) as device:
+    # Load and run simulation
+    print("Loading and running DEVICE simulation...")
+    device.load(device_sim_file)
+    device.switchtolayout()
+    device.run()
+    
+    # Get and process field data
+    electrical_data = get_electric_field(device)
+    
+    # Save results
+    np.savez(os.path.join(device_results_dir, 'E_field_processed.npz'), **electrical_data)
+
+print("Electrical simulation completed!")
+
+#----- Run Optical Simulation -----#
+
+print("\n=== STARTING OPTICAL SIMULATION ===")
+
+# Start Lumerical MODE
+with lumapi.MODE(hide=True) as mode:
+    # Load simulation
+    print("Loading MODE simulation...")
+    mode.load(mode_sim_file)
+    
+    # Get geometry for all components
+    components = ["substrate", "crystalline_si", "si_rib", "anode", "cathode"]
+    for comp in components:
+        geometry = get_component_geometry(mode, comp)
+        if geometry:
+            waveguide_shapes[comp] = geometry
+            print(f"Got {comp} geometry")
+    
+    # Special handling for BTO_imported
+    bto_geometry = get_component_geometry(mode, "BTO::BTO_imported")
+    if bto_geometry:
+        waveguide_shapes["BTO_imported"] = bto_geometry
+        print("Got BTO_imported geometry")
+    
+    # Set up and run mode simulation
+    print("Running mode simulation...")
+    mode.switchtolayout()
+    mode.setanalysis("wavelength", lambda_val)
+    mode.setanalysis("n", searchNeffNear)
+    mode.setnamed("BTO", "import_E_field", True)
+    mode.setnamed("BTO", "bias_point", 1)
+    mode.run()
+    mode.findmodes()
+    
+    # Get field data
+    E_field = mode.getresult("FDE::data::mode1", "E")
+    
+    # Process the field data
+    E = E_field['E']
+    x = E_field['x'][:,0]  # Extract x coordinates
+    z = E_field['z'][:,0]  # Extract z coordinates
+    
+    # Extract field components
+    Ex = E[:,0,:,0,0]
+    Ey = E[:,0,:,0,1]
+    Ez = E[:,0,:,0,2]
+    
+    # Calculate field magnitude and normalize
+    E_mag_opt = np.sqrt(np.abs(Ex)**2 + np.abs(Ey)**2 + np.abs(Ez)**2)
+    E_mag_norm = E_mag_opt / np.max(E_mag_opt)
+    
+    # Store optical data
+    optical_data = {
+        'E_mag_norm': E_mag_norm,
+        'x': x,
+        'z': z,
+        'x_min': np.min(x),
+        'x_max': np.max(x),
+        'z_min': np.min(z),
+        'z_max': np.max(z)
+    }
+
+print("Optical simulation completed!")
+
+#----- Create Visualization -----#
+
+print("\n=== CREATING VISUALIZATION ===")
+
+# Define figure settings
+figsize = (10, 8)
+dpi = 300
+
+# Find common bounds
+common_x_min = max(electrical_data['x_min'], optical_data['x_min'])
+common_x_max = min(electrical_data['x_max'], optical_data['x_max'])
+common_z_min = max(electrical_data['z_min'], optical_data['z_min'])
+common_z_max = min(electrical_data['z_max'], optical_data['z_max'])
+
+# Convert to microns
+common_x_min_um = common_x_min * 1e6
+common_x_max_um = common_x_max * 1e6
+common_z_min_um = common_z_min * 1e6
+common_z_max_um = common_z_max * 1e6
+
+X_elec_um = electrical_data['X'] * 1e6
+Z_elec_um = electrical_data['Z'] * 1e6
+
+# Get optical data extent
+x_opt_um = optical_data['x'] * 1e6
+z_opt_um = optical_data['z'] * 1e6
+extent_opt = [min(x_opt_um), max(x_opt_um), min(z_opt_um), max(z_opt_um)]
+
+# Create figure with black background
+plt.figure(figsize=figsize, facecolor='black')
+ax = plt.gca()
+ax.set_facecolor('black')
+
+# 1. Plot optical mode
+im = plt.imshow(np.transpose(optical_data['E_mag_norm']), 
+              origin='lower', extent=extent_opt, 
+              cmap='viridis', interpolation='bilinear')
+
+# 2. Plot E-field vectors
+plt.quiver(X_elec_um, Z_elec_um, np.transpose(electrical_data['Ex']), 
+         np.transpose(electrical_data['Ez']), color='white', 
+         scale=np.max(electrical_data['E_mag'])*2, width=0.002)
+
+# 3. Plot structure outlines
+for comp, dims in waveguide_shapes.items():
+    # Convert to microns
+    xmin = dims["x min"] * 1e6
+    xmax = dims["x max"] * 1e6
+    zmin = dims["z min"] * 1e6
+    zmax = dims["z max"] * 1e6
+    
+    # Create rectangle
+    rect = sg.box(xmin, zmin, xmax, zmax)
+    
+    # Plot outline
+    xs, ys = rect.exterior.xy
+    plt.plot(xs, ys, 'w-', linewidth=0.75, alpha=0.7)
+
+# Set consistent plot bounds
+plt.xlim(common_x_min_um, common_x_max_um)
+plt.ylim(common_z_min_um, common_z_max_um)
+
+# Add colorbar
+cbar = plt.colorbar(im)
+cbar.set_label('Normalized Optical |E|²', color='white')
+cbar.ax.yaxis.set_tick_params(color='white')
+plt.setp(plt.getp(cbar.ax.axes, 'yticklabels'), color='white')
+
+# Set labels and title
+plt.xlabel('x [μm]', color='white')
+plt.ylabel('z [μm]', color='white')
+plt.title('Optical Mode with E-field Vectors and Device Structure', color='white')
+
+# Make ticks white
+ax.tick_params(axis='x', colors='white')
+ax.tick_params(axis='y', colors='white')
+
+# Save the figure
+plt.tight_layout()
+plt.savefig(os.path.join(plot_results_dir, 'combined_plot_black.png'), dpi=dpi, facecolor='black')
+
+print(f"Plot saved to {os.path.join(plot_results_dir, 'combined_plot_black.png')}")
+
+# Optional: Create a white background version
+plt.figure(figsize=figsize, facecolor='white')
+ax = plt.gca()
+ax.set_facecolor('white')
+
+# 1. Plot optical mode
+im = plt.imshow(np.transpose(optical_data['E_mag_norm']), 
+              origin='lower', extent=extent_opt, 
+              cmap='viridis', interpolation='bilinear')
+
+# 2. Plot structure outlines
+for comp, dims in waveguide_shapes.items():
+    # Convert to microns
+    xmin = dims["x min"] * 1e6
+    xmax = dims["x max"] * 1e6
+    zmin = dims["z min"] * 1e6
+    zmax = dims["z max"] * 1e6
+    
+    # Create rectangle
+    rect = sg.box(xmin, zmin, xmax, zmax)
+    
+    # Plot outline
+    xs, ys = rect.exterior.xy
+    plt.plot(xs, ys, 'w', linewidth=0.75, alpha=0.7)
+
+# Set consistent plot bounds
+plt.xlim(-1.8, 1.8)
+plt.ylim(common_z_min_um, common_z_max_um)
+
+# Add colorbar
+cbar = plt.colorbar(im)
+cbar.set_label('Normalized Optical |E|²')
+
+# Set labels and title
+plt.xlabel('x [μm]')
+plt.ylabel('z [μm]')
+plt.title('Optical Mode with Device Structure')
+
+# Save the figure
+plt.tight_layout()
+plt.savefig(os.path.join(plot_results_dir, 'optical_only_white.png'), dpi=dpi, facecolor='white')
+
+print(f"Plot saved to {os.path.join(plot_results_dir, 'optical_only_white.png')}")
+print("\n=== ELECTRO-OPTIC SIMULATION WORKFLOW COMPLETED ===")
+
+# Display plots
+plt.show()
